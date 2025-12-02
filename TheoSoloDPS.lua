@@ -1,22 +1,22 @@
 -- TheoSoloDPS (Vanilla/Turtle 1.12)
--- Personal-only DPS + procs + hit-table stats.
+-- Personal-only DPS + procs + hit-table stats + proc whitelist manager UI.
 --
--- /tdps           : toggle window
--- /tdps reset     : reset "since last reset" segment
+-- /tdps                 : toggle window
+-- /tdps reset           : reset "since last reset" segment
 -- /tdps lock|unlock
--- /tdps proc add <name>  : track buff-only procs by name
--- /tdps proc del <name>
+-- /tdps proc add <name> : add to proc whitelist
+-- /tdps proc del <name> : remove from proc whitelist
 -- /tdps proc list
 --
 -- Extra-attacks:
--- Tracks ANY line matching:
+-- Tracks lines like:
 --   You gain 1 extra attack through Timeless Strike.
 --   You gain 2 extra attacks through Windfury Weapon!
 --   You gain 1 exta attack through ... (typo)
 --
 -- It always sums into "Extra Attacks" (total extra swings granted).
 -- If the proc source name is in your whitelist, it also tracks that proc separately
--- (counts = how many extra attacks that proc granted).
+-- (counts = how many extra swings that proc granted).
 
 TheoSoloDPS = {}
 local A = TheoSoloDPS
@@ -31,7 +31,7 @@ local function DB()
   p.pos = p.pos or { point="CENTER", rel="CENTER", x=0, y=0 }
   p.visible = (p.visible == nil) and 1 or p.visible
   p.lock = (p.lock == nil) and 0 or p.lock
-  p.procWhitelist = p.procWhitelist or {} -- buff-only procs you manually add (AND extra-attack proc sources you want listed)
+  p.procWhitelist = p.procWhitelist or {} -- buff-only procs you add (AND extra-attack sources you want listed)
   p.procBlacklist = p.procBlacklist or {} -- never count as proc
   p.autoProcFromUnknownDamage = (p.autoProcFromUnknownDamage == nil) and 1 or p.autoProcFromUnknownDamage
   p.autoProcFromUnknownBuffs  = (p.autoProcFromUnknownBuffs  == nil) and 0 or p.autoProcFromUnknownBuffs
@@ -186,7 +186,6 @@ end
 local function AddExtraAttacks(n)
   n = tonumber(n)
   if not n or n <= 0 then return end
-  -- One unified bucket for total extra swings
   IncProc("Extra Attacks", 0, n)
 end
 
@@ -278,13 +277,9 @@ local function ParseAutoHitResult(msg)
   msg = StripColors(msg)
   msg = trim(msg)
 
-  if string.match(msg, "^You crit ") then
-    return "crit"
-  end
+  if string.match(msg, "^You crit ") then return "crit" end
   if string.match(msg, "^You hit ") then
-    if string.find(string.lower(msg), "glancing") then
-      return "glance"
-    end
+    if string.find(string.lower(msg), "glancing") then return "glance" end
     return "hit"
   end
   return nil
@@ -355,6 +350,8 @@ f:SetScript("OnEvent", function()
     else
       if A.window then A.window:Hide() end
     end
+    if A.Refresh then A.Refresh() end
+    if A.ProcUI and A.ProcUI.Update then A.ProcUI.Update() end
     return
   end
 
@@ -371,13 +368,14 @@ f:SetScript("OnEvent", function()
   if extraCt and extraCt > 0 and string.match(StripColors(msg), "^You gain") then
     AddExtraAttacks(extraCt)
     if procName and DB().procWhitelist[procName] then
+      -- counts = extra swings granted by that proc
       IncProc(procName, 0, extraCt)
     end
     if A.Refresh then A.Refresh() end
     return
   end
 
-  -- Auto hit table (white swings)
+  -- Auto hit table + melee DPS (white swings)
   if event == "CHAT_MSG_COMBAT_SELF_HITS" then
     local res = ParseAutoHitResult(msg)
     if res == "hit" then IncStat("auto", "hit", 1)
@@ -385,13 +383,13 @@ f:SetScript("OnEvent", function()
     elseif res == "glance" then IncStat("auto", "glance", 1)
     end
 
-    -- also parse damage for DPS
     local action, amount = ParseSelfMeleeDamage(msg)
     if action and amount then
       AddDamage(action, amount)
       if A.Refresh then A.Refresh() end
       return
     end
+
   elseif event == "CHAT_MSG_COMBAT_SELF_MISSES" then
     local res = ParseAutoMissResult(msg)
     if res then IncStat("auto", res, 1) end
@@ -411,6 +409,7 @@ f:SetScript("OnEvent", function()
       if A.Refresh then A.Refresh() end
       return
     end
+
   elseif event == "CHAT_MSG_SPELL_PERIODIC_CREATURE_DAMAGE"
       or event == "CHAT_MSG_SPELL_PERIODIC_HOSTILEPLAYER_DAMAGE"
       or event == "CHAT_MSG_SPELL_PERIODIC_FRIENDLYPLAYER_DAMAGE" then
@@ -435,7 +434,7 @@ f:SetScript("OnEvent", function()
 end)
 
 -- ----------------------------
--- UI
+-- UI helpers
 -- ----------------------------
 local function CreateBackdrop(frame)
   frame:SetBackdrop({
@@ -461,9 +460,15 @@ local function Shorten(n)
   return tostring(math.floor(n + 0.5))
 end
 
+local NUM_ROWS = 8
+local ROW_H = 15
+
+-- ----------------------------
+-- Main window
+-- ----------------------------
 local window = CreateFrame("Frame", "TheoSoloDPSFrame", UIParent)
 A.window = window
-window:SetWidth(300); window:SetHeight(235)
+window:SetWidth(310); window:SetHeight(235)
 CreateBackdrop(window)
 window:SetClampedToScreen(true)
 window:SetMovable(true)
@@ -516,6 +521,14 @@ local content = CreateFrame("Frame", nil, window)
 content:SetPoint("TOPLEFT", 8, -70)
 content:SetPoint("BOTTOMRIGHT", -8, 34)
 
+-- Scrollbar for ALL tabs (FauxScrollFrame)
+local scrollFrame = CreateFrame("ScrollFrame", "TheoSoloDPSScrollFrame", content, "FauxScrollFrameTemplate")
+scrollFrame:SetPoint("TOPLEFT", content, "TOPLEFT", 0, 0)
+scrollFrame:SetPoint("BOTTOMRIGHT", content, "BOTTOMRIGHT", 0, 0)
+scrollFrame:SetScript("OnVerticalScroll", function()
+  FauxScrollFrame_OnVerticalScroll(this, arg1, ROW_H, function() if A.Refresh then A.Refresh() end end)
+end)
+
 local rows = {}
 local function CreateRow(i)
   local r = CreateFrame("StatusBar", nil, content)
@@ -523,8 +536,8 @@ local function CreateRow(i)
   r:SetMinMaxValues(0, 1)
   r:SetValue(0)
   r:SetHeight(14)
-  r:SetPoint("TOPLEFT", 0, -((i-1)*15))
-  r:SetPoint("TOPRIGHT", 0, -((i-1)*15))
+  r:SetPoint("TOPLEFT", 0, -((i-1)*ROW_H))
+  r:SetPoint("TOPRIGHT", -24, -((i-1)*ROW_H)) -- leave room for scrollbar
   r.bg = r:CreateTexture(nil, "BACKGROUND")
   r.bg:SetAllPoints(r)
   r.bg:SetTexture("Interface\\BUTTONS\\WHITE8X8")
@@ -540,17 +553,18 @@ local function CreateRow(i)
 
   return r
 end
-for i=1,8 do rows[i] = CreateRow(i) end
+for i=1,NUM_ROWS do rows[i] = CreateRow(i) end
 
 -- Footer buttons
-local resetBtn = MakeButton(window, "Reset", 60, 18)
+local resetBtn = MakeButton(window, "Reset", 55, 18)
 resetBtn:SetPoint("BOTTOMLEFT", 8, 8)
 resetBtn:SetScript("OnClick", function()
   ResetSegment()
   if A.Refresh then A.Refresh() end
+  if A.ProcUI and A.ProcUI.Update then A.ProcUI.Update() end
 end)
 
-local lockBtn = MakeButton(window, "Lock", 60, 18)
+local lockBtn = MakeButton(window, "Lock", 55, 18)
 lockBtn:SetPoint("LEFT", resetBtn, "RIGHT", 6, 0)
 lockBtn:SetScript("OnClick", function()
   local p = DB()
@@ -558,15 +572,25 @@ lockBtn:SetScript("OnClick", function()
   this:SetText(p.lock == 1 and "Unlock" or "Lock")
 end)
 
-local helpBtn = MakeButton(window, "Cmds", 60, 18)
+local helpBtn = MakeButton(window, "Cmds", 55, 18)
 helpBtn:SetPoint("LEFT", lockBtn, "RIGHT", 6, 0)
 helpBtn:SetScript("OnClick", function()
   DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99TheoSoloDPS|r: /tdps, /tdps reset, /tdps lock|unlock, /tdps proc add <name>, /tdps proc del <name>, /tdps proc list")
 end)
 
+-- Proc manager button (opens whitelist UI)
+local procBtn = MakeButton(window, "Procs", 55, 18)
+procBtn:SetPoint("LEFT", helpBtn, "RIGHT", 6, 0)
+
 -- Tab state
 local activeTab = "dps"
 local statsMode = "auto" -- "auto" or "abil"
+
+local function ResetScroll()
+  scrollFrame.offset = 0
+  local sb = _G["TheoSoloDPSScrollFrameScrollBar"]
+  if sb then sb:SetValue(0) end
+end
 
 local function SetTab(which)
   activeTab = which
@@ -585,6 +609,8 @@ local function SetTab(which)
     statsAutoBtn:Hide()
     statsAbilBtn:Hide()
   end
+
+  ResetScroll()
 end
 
 tabDPS:SetScript("OnClick", function() SetTab("dps"); if A.Refresh then A.Refresh() end end)
@@ -594,11 +620,13 @@ tabStats:SetScript("OnClick", function() SetTab("stats"); if A.Refresh then A.Re
 statsAutoBtn:SetScript("OnClick", function()
   statsMode = "auto"
   statsAutoBtn:Disable(); statsAbilBtn:Enable()
+  ResetScroll()
   if A.Refresh then A.Refresh() end
 end)
 statsAbilBtn:SetScript("OnClick", function()
   statsMode = "abil"
   statsAbilBtn:Disable(); statsAutoBtn:Enable()
+  ResetScroll()
   if A.Refresh then A.Refresh() end
 end)
 
@@ -607,91 +635,200 @@ tabDPS:Disable(); tabProcs:Enable(); tabStats:Enable()
 statsAutoBtn:Hide(); statsAbilBtn:Hide()
 statsAutoBtn:Disable(); statsAbilBtn:Enable()
 
-A.Refresh = function()
-  lockBtn:SetText(DB().lock == 1 and "Unlock" or "Lock")
+-- ----------------------------
+-- Proc Whitelist Manager UI
+-- ----------------------------
+A.ProcUI = A.ProcUI or {}
+do
+  local pf = CreateFrame("Frame", "TheoSoloDPSProcFrame", window)
+  A.ProcUI.frame = pf
+  pf:SetWidth(260); pf:SetHeight(230)
+  pf:SetPoint("TOPLEFT", window, "TOPRIGHT", 8, 0)
+  pf:SetFrameStrata("DIALOG")
+  pf:SetFrameLevel(window:GetFrameLevel() + 10)
+  CreateBackdrop(pf)
+  pf:Hide()
 
-  local entry = (playerName and A.data.damage[1][playerName]) or nil
-  local total = (entry and entry._sum) or 0
-  local ctime = (entry and entry._ctime) or 1
-  local dps = (total / math.max(1, ctime))
+  local t = pf:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  t:SetPoint("TOPLEFT", 10, -10)
+  t:SetText("Proc Whitelist")
+
+  local c = CreateFrame("Button", nil, pf, "UIPanelCloseButton")
+  c:SetPoint("TOPRIGHT", 2, 2)
+  c:SetScript("OnClick", function() pf:Hide() end)
+
+  local hint = pf:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  hint:SetPoint("TOPLEFT", 10, -30)
+  hint:SetJustifyH("LEFT")
+  hint:SetText("Add procs here (keeps /tdps proc commands too).")
+
+  local listArea = CreateFrame("Frame", nil, pf)
+  listArea:SetPoint("TOPLEFT", 10, -50)
+  listArea:SetPoint("TOPRIGHT", -10, -50)
+  listArea:SetHeight(120)
+
+  local procScroll = CreateFrame("ScrollFrame", "TheoSoloDPSProcScrollFrame", listArea, "FauxScrollFrameTemplate")
+  procScroll:SetPoint("TOPLEFT", listArea, "TOPLEFT", 0, 0)
+  procScroll:SetPoint("BOTTOMRIGHT", listArea, "BOTTOMRIGHT", 0, 0)
+
+  local PROC_ROWS = 6
+  local procRows = {}
+  local selected = nil
+
+  local function SetSelected(name)
+    selected = name
+    if name then
+      _G["TheoSoloDPSProcEditBox"]:SetText(name)
+      _G["TheoSoloDPSProcEditBox"]:HighlightText()
+    end
+  end
+
+  local function CreateProcRow(i)
+    local b = CreateFrame("Button", nil, listArea)
+    b:SetHeight(18)
+    b:SetPoint("TOPLEFT", 0, -((i-1)*18))
+    b:SetPoint("TOPRIGHT", -24, -((i-1)*18))
+
+    b.hl = b:CreateTexture(nil, "BACKGROUND")
+    b.hl:SetAllPoints(b)
+    b.hl:SetTexture("Interface\\BUTTONS\\WHITE8X8")
+    b.hl:SetVertexColor(1,1,1,0.12)
+    b.hl:Hide()
+
+    b.text = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    b.text:SetPoint("LEFT", 2, 0)
+    b.text:SetJustifyH("LEFT")
+
+    b:SetScript("OnClick", function()
+      if this.name then
+        SetSelected(this.name)
+        if A.ProcUI.Update then A.ProcUI.Update() end
+      end
+    end)
+
+    return b
+  end
+  for i=1,PROC_ROWS do procRows[i] = CreateProcRow(i) end
+
+  procScroll:SetScript("OnVerticalScroll", function()
+    FauxScrollFrame_OnVerticalScroll(this, arg1, 18, function() if A.ProcUI.Update then A.ProcUI.Update() end end)
+  end)
+
+  local edit = CreateFrame("EditBox", "TheoSoloDPSProcEditBox", pf, "InputBoxTemplate")
+  edit:SetAutoFocus(false)
+  edit:SetWidth(220); edit:SetHeight(20)
+  edit:SetPoint("BOTTOMLEFT", 12, 46)
+  edit:SetScript("OnEscapePressed", function() this:ClearFocus() end)
+  edit:SetScript("OnEnterPressed", function() this:ClearFocus() end)
+
+  local addB = MakeButton(pf, "Add", 60, 18)
+  addB:SetPoint("BOTTOMLEFT", 12, 22)
+  addB:SetScript("OnClick", function()
+    local name = trim(edit:GetText() or "")
+    if name == "" then return end
+    DB().procWhitelist[name] = true
+    SetSelected(name)
+    if A.ProcUI.Update then A.ProcUI.Update() end
+    if A.Refresh then A.Refresh() end
+  end)
+
+  local delB = MakeButton(pf, "Del", 60, 18)
+  delB:SetPoint("LEFT", addB, "RIGHT", 6, 0)
+  delB:SetScript("OnClick", function()
+    local name = trim(edit:GetText() or "")
+    if name == "" then name = selected end
+    if not name or name == "" then return end
+    DB().procWhitelist[name] = nil
+    if selected == name then selected = nil end
+    edit:SetText("")
+    if A.ProcUI.Update then A.ProcUI.Update() end
+    if A.Refresh then A.Refresh() end
+  end)
+
+  local clearB = MakeButton(pf, "Clear", 60, 18)
+  clearB:SetPoint("LEFT", delB, "RIGHT", 6, 0)
+  clearB:SetScript("OnClick", function()
+    selected = nil
+    edit:SetText("")
+    if A.ProcUI.Update then A.ProcUI.Update() end
+  end)
+
+  local function GetWhitelist()
+    local list = {}
+    for n,_ in pairs(DB().procWhitelist) do table.insert(list, n) end
+    table.sort(list, function(a,b) return string.lower(a) < string.lower(b) end)
+    return list
+  end
+
+  A.ProcUI.Update = function()
+    if not pf:IsShown() then return end
+    local wl = GetWhitelist()
+    FauxScrollFrame_Update(procScroll, table.getn(wl), PROC_ROWS, 18)
+    local off = FauxScrollFrame_GetOffset(procScroll) or 0
+    for i=1,PROC_ROWS do
+      local idx = i + off
+      local b = procRows[i]
+      local name = wl[idx]
+      if name then
+        b.name = name
+        b.text:SetText(name)
+        if selected == name then b.hl:Show() else b.hl:Hide() end
+        b:Show()
+      else
+        b.name = nil
+        b.text:SetText("")
+        b.hl:Hide()
+        b:Hide()
+      end
+    end
+  end
+
+  -- Toggle from main button
+  procBtn:SetScript("OnClick", function()
+    if pf:IsShown() then pf:Hide() else pf:Show(); if A.ProcUI.Update then A.ProcUI.Update() end end
+  end)
+end
+
+-- ----------------------------
+-- Main list rendering (with scrollbar)
+-- ----------------------------
+local function BuildListForTab()
+  local items = {}
+  local maxVal = 0
 
   if activeTab == "dps" then
-    summary:SetText(string.format("Total: %s  |  DPS: %.1f  |  Time: %ds", Shorten(total), dps, math.floor(ctime)))
-
-    local list = {}
+    local entry = (playerName and A.data.damage[1][playerName]) or nil
+    local total = (entry and entry._sum) or 0
     if entry then
       for k,v in pairs(entry) do
         if not A.internals[k] and type(v) == "number" then
-          table.insert(list, { name=k, dmg=v })
+          table.insert(items, { name=k, val=v, kind="dps", total=total })
+          if v > maxVal then maxVal = v end
         end
       end
     end
-    table.sort(list, function(a,b) return a.dmg > b.dmg end)
-    local top = list[1] and list[1].dmg or 0
-
-    for i=1,8 do
-      local r = rows[i]
-      local item = list[i]
-      if item and total > 0 then
-        local pct = (item.dmg / total) * 100
-        r:SetValue(item.dmg / math.max(1, top))
-        r.left:SetText(item.name)
-        r.right:SetText(string.format("%s (%.1f%%)", Shorten(item.dmg), pct))
-        r:Show()
-      else
-        r:SetValue(0); r.left:SetText(""); r.right:SetText(""); r:Hide()
-      end
-    end
+    table.sort(items, function(a,b) return a.val > b.val end)
 
   elseif activeTab == "procs" then
     local procs = A.data.procs[1] or {}
-    local list = {}
-    local totalEvents = 0
     for name, t in pairs(procs) do
       if type(t) == "table" then
-        totalEvents = totalEvents + (t.count or 0)
-        table.insert(list, { name=name, count=(t.count or 0), dmg=(t.dmg or 0) })
-      end
-    end
-    table.sort(list, function(a,b)
-      if a.count == b.count then return (a.dmg or 0) > (b.dmg or 0) end
-      return a.count > b.count
-    end)
-
-    summary:SetText(string.format("Proc counts: %d  |  Time: %ds", totalEvents, math.floor(SegmentElapsed())))
-
-    local top = list[1] and list[1].count or 0
-    for i=1,8 do
-      local r = rows[i]
-      local item = list[i]
-      if item and top > 0 and item.count > 0 then
-        r:SetValue(item.count / top)
-        r.left:SetText(item.name)
-
-        if item.name == "Extra Attacks" then
-          r.right:SetText(string.format("%d attacks", math.floor(item.count)))
-        elseif item.dmg and item.dmg > 0 then
-          r.right:SetText(string.format("%dx  |  %s dmg", item.count, Shorten(item.dmg)))
-        else
-          r.right:SetText(string.format("%dx", item.count))
+        local c = t.count or 0
+        if c > 0 then
+          table.insert(items, { name=name, val=c, dmg=(t.dmg or 0), kind="proc" })
+          if c > maxVal then maxVal = c end
         end
-
-        r:Show()
-      else
-        r:SetValue(0); r.left:SetText(""); r.right:SetText(""); r:Hide()
       end
     end
+    table.sort(items, function(a,b)
+      if a.val == b.val then return (a.dmg or 0) > (b.dmg or 0) end
+      return a.val > b.val
+    end)
 
   else -- stats
     local auto, abil = EnsureStats()
-    local autoTotal = SumStats(auto, { "hit","crit","glance","miss","dodge","parry","block" })
-    local abilTotal = SumStats(abil, { "hit","crit","miss","dodge","parry","block","resist","immune" })
-
-    summary:SetText(string.format("Auto: %d  |  Abil: %d  |  Time: %ds", autoTotal, abilTotal, math.floor(SegmentElapsed())))
-
     if statsMode == "auto" then
-      statsAutoBtn:Disable(); statsAbilBtn:Enable()
-      local totalAtt = autoTotal
+      local total = SumStats(auto, { "hit","crit","glance","miss","dodge","parry","block" })
       local cats = {
         { key="hit", name="Hits" },
         { key="crit", name="Crits" },
@@ -701,36 +838,15 @@ A.Refresh = function()
         { key="parry", name="Parry" },
         { key="block", name="Block" },
       }
-      local tmp = {}
       for _,c in ipairs(cats) do
-        table.insert(tmp, { name=c.name, val=(auto[c.key] or 0) })
+        local v = auto[c.key] or 0
+        table.insert(items, { name=c.name, val=v, kind="stat", total=total })
+        if v > maxVal then maxVal = v end
       end
-      table.sort(tmp, function(a,b) return a.val > b.val end)
-      local top = tmp[1] and tmp[1].val or 0
-
-      for i=1,7 do
-        local r = rows[i]
-        local item = tmp[i]
-        if item and item.val > 0 and totalAtt > 0 then
-          r:SetValue(item.val / math.max(1, top))
-          r.left:SetText(item.name)
-          r.right:SetText(string.format("%d (%.1f%%)", item.val, (item.val/totalAtt)*100))
-          r:Show()
-        else
-          r:SetValue(0); r.left:SetText(""); r.right:SetText(""); r:Hide()
-        end
-      end
-
-      -- Total row
-      local r = rows[8]
-      r:SetValue(1)
-      r.left:SetText("Total Swings")
-      r.right:SetText(tostring(totalAtt))
-      r:Show()
-
+      table.insert(items, { name="Total Swings", val=total, kind="stat_total" })
+      if total > maxVal then maxVal = total end
     else
-      statsAbilBtn:Disable(); statsAutoBtn:Enable()
-      local totalAtt = abilTotal
+      local total = SumStats(abil, { "hit","crit","miss","dodge","parry","block","resist","immune" })
       local cats = {
         { key="hit", name="Hits" },
         { key="crit", name="Crits" },
@@ -739,32 +855,98 @@ A.Refresh = function()
         { key="parry", name="Parry" },
         { key="block", name="Block" },
         { key="resist", name="Resist" },
+        -- (immune exists but we keep it out of the top 8 to preserve total; add if you want)
       }
-      local tmp = {}
       for _,c in ipairs(cats) do
-        table.insert(tmp, { name=c.name, val=(abil[c.key] or 0) })
+        local v = abil[c.key] or 0
+        table.insert(items, { name=c.name, val=v, kind="stat", total=total })
+        if v > maxVal then maxVal = v end
       end
-      table.sort(tmp, function(a,b) return a.val > b.val end)
-      local top = tmp[1] and tmp[1].val or 0
+      table.insert(items, { name="Total Abilities", val=total, kind="stat_total" })
+      if total > maxVal then maxVal = total end
+    end
+  end
 
-      for i=1,7 do
-        local r = rows[i]
-        local item = tmp[i]
-        if item and item.val > 0 and totalAtt > 0 then
-          r:SetValue(item.val / math.max(1, top))
-          r.left:SetText(item.name)
-          r.right:SetText(string.format("%d (%.1f%%)", item.val, (item.val/totalAtt)*100))
-          r:Show()
+  return items, maxVal
+end
+
+A.Refresh = function()
+  lockBtn:SetText(DB().lock == 1 and "Unlock" or "Lock")
+
+  -- Tab-dependent header
+  local entry = (playerName and A.data.damage[1][playerName]) or nil
+  local total = (entry and entry._sum) or 0
+  local ctime = (entry and entry._ctime) or 1
+  local dps = (total / math.max(1, ctime))
+
+  if activeTab == "dps" then
+    summary:SetText(string.format("Total: %s  |  DPS: %.1f  |  Time: %ds", Shorten(total), dps, math.floor(ctime)))
+  elseif activeTab == "procs" then
+    local procs = A.data.procs[1] or {}
+    local extra = (procs["Extra Attacks"] and procs["Extra Attacks"].count) or 0
+    local other = 0
+    for name, t in pairs(procs) do
+      if name ~= "Extra Attacks" and type(t) == "table" then
+        other = other + (t.count or 0)
+      end
+    end
+    summary:SetText(string.format("Procs: %d  |  Extra: %d  |  Time: %ds", other, extra, math.floor(SegmentElapsed())))
+  else
+    local auto, abil = EnsureStats()
+    local autoTotal = SumStats(auto, { "hit","crit","glance","miss","dodge","parry","block" })
+    local abilTotal = SumStats(abil, { "hit","crit","miss","dodge","parry","block","resist","immune" })
+    summary:SetText(string.format("Auto: %d  |  Abil: %d  |  Time: %ds", autoTotal, abilTotal, math.floor(SegmentElapsed())))
+  end
+
+  -- Build render list + update scrollbar
+  local items, maxVal = BuildListForTab()
+  FauxScrollFrame_Update(scrollFrame, table.getn(items), NUM_ROWS, ROW_H)
+  local off = FauxScrollFrame_GetOffset(scrollFrame) or 0
+
+  for i=1,NUM_ROWS do
+    local r = rows[i]
+    local idx = i + off
+    local it = items[idx]
+
+    if it then
+      local v = it.val or 0
+      r:SetValue((maxVal > 0) and (v / maxVal) or 0)
+      r.left:SetText(it.name or "")
+
+      if it.kind == "dps" then
+        local pct = (it.total and it.total > 0) and ((v / it.total) * 100) or 0
+        r.right:SetText(string.format("%s (%.1f%%)", Shorten(v), pct))
+      elseif it.kind == "proc" then
+        if it.name == "Extra Attacks" then
+          r.right:SetText(string.format("%d attacks", v))
         else
-          r:SetValue(0); r.left:SetText(""); r.right:SetText(""); r:Hide()
+          -- For whitelisted extra-attack sources, count == attacks; for buff procs, count == procs.
+          if it.dmg and it.dmg > 0 then
+            r.right:SetText(string.format("%dx  |  %s dmg", v, Shorten(it.dmg)))
+          else
+            -- If it's whitelisted AND appears as an extra-attack source in your log, this will look right:
+            if DB().procWhitelist[it.name] then
+              r.right:SetText(string.format("%d", v))
+            else
+              r.right:SetText(string.format("%dx", v))
+            end
+          end
         end
+      elseif it.kind == "stat" then
+        local pct = (it.total and it.total > 0) and ((v / it.total) * 100) or 0
+        r.right:SetText(string.format("%d (%.1f%%)", v, pct))
+      elseif it.kind == "stat_total" then
+        r.right:SetText(tostring(v))
+      else
+        r.right:SetText(tostring(v))
       end
 
-      local r = rows[8]
-      r:SetValue(1)
-      r.left:SetText("Total Abilities")
-      r.right:SetText(tostring(totalAtt))
       r:Show()
+    else
+      r:SetValue(0)
+      r.left:SetText("")
+      r.right:SetText("")
+      r:Hide()
     end
   end
 end
@@ -791,6 +973,7 @@ SlashCmdList["THEOSOLODPS"] = function(msg)
   elseif cmd == "reset" then
     ResetSegment()
     A.Refresh()
+    if A.ProcUI and A.ProcUI.Update then A.ProcUI.Update() end
     DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99TheoSoloDPS|r reset.")
     return
   elseif cmd == "lock" then
@@ -809,10 +992,12 @@ SlashCmdList["THEOSOLODPS"] = function(msg)
     if sub == "add" and name ~= "" then
       DB().procWhitelist[name] = true
       DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99TheoSoloDPS|r proc added: " .. name)
+      if A.ProcUI and A.ProcUI.Update then A.ProcUI.Update() end
       return
     elseif sub == "del" and name ~= "" then
       DB().procWhitelist[name] = nil
       DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99TheoSoloDPS|r proc removed: " .. name)
+      if A.ProcUI and A.ProcUI.Update then A.ProcUI.Update() end
       return
     elseif sub == "list" then
       DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99TheoSoloDPS|r proc whitelist:")
@@ -832,6 +1017,10 @@ SlashCmdList["THEOSOLODPS"] = function(msg)
     window:Hide()
   else
     DB().visible = 1
+    window:Show()
+  end
+end
+
     window:Show()
   end
 end
