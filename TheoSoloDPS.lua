@@ -1,17 +1,24 @@
 -- TheoSoloDPS (Vanilla/Turtle 1.12)
--- /tdps : toggle window
--- /tdps reset : reset "since last reset" segment
+-- Personal-only DPS + proc tracker.
+--
+-- /tdps           : toggle window
+-- /tdps reset     : reset "since last reset" segment
 -- /tdps lock|unlock
--- /tdps proc add <name>  (track buff-only proc by name)
+-- /tdps proc add <name>  (track buff-only procs by name, e.g. "Kiss of the Spider")
 -- /tdps proc del <name>
 -- /tdps proc list
+--
+-- Extra-attacks:
+-- Tracks ANY combat log event line matching:
+--   You gain 1 extra attack through Timeless Strike.
+--   You gain 2 extra attacks through Windfury Weapon!
+--   You gain 1 exta attack through ...           (typo)
+-- All merged into ONE proc bucket:
+--   "Extra Attacks" = total extra swings granted (numbers are summed)
 
 TheoSoloDPS = {}
 local A = TheoSoloDPS
 
--- ----------------------------
--- SavedVariables defaults
--- ----------------------------
 TheoSoloDPSDB = TheoSoloDPSDB or {}
 local function DB()
   TheoSoloDPSDB.profile = TheoSoloDPSDB.profile or {}
@@ -26,9 +33,6 @@ local function DB()
   return p
 end
 
--- ----------------------------
--- Runtime tables (since last reset)
--- ----------------------------
 A.data = {
   damage = { [1] = {} }, -- [1][playerName][action]=dmg ; with _sum/_ctime/_tick
   procs  = { [1] = {} }, -- [1][procName]={count=n, dmg=n}
@@ -40,6 +44,13 @@ local playerName = nil
 local knownSpells = {}
 
 local function trim(s) return string.gsub(s or "", "^%s*(.-)%s*$", "%1") end
+
+local function StripColors(msg)
+  -- remove chat color codes, just in case
+  msg = string.gsub(msg or "", "|c%x%x%x%x%x%x%x%x", "")
+  msg = string.gsub(msg or "", "|r", "")
+  return msg
+end
 
 local function ScanSpellbook()
   knownSpells = {}
@@ -87,17 +98,20 @@ local function AddDamage(action, amount)
   AddTime(entry)
 end
 
-local function IncProc(name, dmg)
+local function IncProc(name, dmg, inc)
   if not name or name == "" then return end
   local p = DB()
   name = trim(name)
 
-  -- blacklist wins
   if p.procBlacklist[name] then return end
 
   local seg = A.data.procs[1]
   seg[name] = seg[name] or { count = 0, dmg = 0 }
-  seg[name].count = (seg[name].count or 0) + 1
+
+  inc = tonumber(inc) or 1
+  if inc < 1 then inc = 1 end
+
+  seg[name].count = (seg[name].count or 0) + inc
   if dmg and tonumber(dmg) and tonumber(dmg) > 0 then
     seg[name].dmg = (seg[name].dmg or 0) + tonumber(dmg)
   end
@@ -111,15 +125,12 @@ local function IsProcAction(name, isDamage)
   if p.procBlacklist[name] then return false end
   if p.procWhitelist[name] then return true end
 
-  -- "Melee" isn't a proc
   if name == "Melee" then return false end
 
-  -- Heuristic: unknown damage sources are usually enchants/items/set bonuses.
   if isDamage and p.autoProcFromUnknownDamage == 1 and not knownSpells[name] then
     return true
   end
 
-  -- Much riskier: unknown buffs can include raid externals (PI, Kings, etc.)
   if (not isDamage) and p.autoProcFromUnknownBuffs == 1 and not knownSpells[name] then
     return true
   end
@@ -130,15 +141,21 @@ end
 local function AddBuffProc(buffName)
   if not buffName then return end
   if IsProcAction(buffName, false) then
-    IncProc(buffName, 0)
+    IncProc(buffName, 0, 1)
   end
 end
 
 local function AddDamageProc(action, amount)
   if not action then return end
   if IsProcAction(action, true) then
-    IncProc(action, amount)
+    IncProc(action, amount, 1)
   end
+end
+
+local function AddExtraAttacks(n)
+  n = tonumber(n)
+  if not n or n <= 0 then return end
+  IncProc("Extra Attacks", 0, n)
 end
 
 local function ResetSegment()
@@ -147,64 +164,79 @@ local function ResetSegment()
 end
 
 -- ----------------------------
--- Combat log parsing (English patterns; easy to extend)
+-- Combat log parsing (EN patterns; extend as needed)
 -- ----------------------------
--- Returns: actionName, amount
 local function ParseSelfSpellDamage(msg)
-  -- Your Fireball hits X for 123 Fire damage.
   local action, amount = string.match(msg, "^Your (.-) hits .- for (%d+)")
   if action and amount then return action, tonumber(amount) end
-
-  -- Your Fireball crits X for 246 Fire damage.
   action, amount = string.match(msg, "^Your (.-) crits .- for (%d+)")
   if action and amount then return action, tonumber(amount) end
-
   return nil
 end
 
 local function ParseSelfMeleeDamage(msg)
-  -- You hit X for 100.
   local amount = string.match(msg, "^You hit .- for (%d+)")
   if amount then return "Melee", tonumber(amount) end
-
-  -- You crit X for 200.
   amount = string.match(msg, "^You crit .- for (%d+)")
   if amount then return "Melee", tonumber(amount) end
-
   return nil
 end
 
 local function ParsePeriodicYourDamage(msg)
-  -- X suffers 15 Nature damage from your Serpent Sting.
   local _, amount, action = string.match(msg, "^(.-) suffers (%d+) .- from your (.-)%.?$")
   if action and amount then return action, tonumber(amount) end
   return nil
 end
 
 local function ParseBuffGain(msg)
-  -- You gain Kiss of the Spider.
   local buff = string.match(msg, "^You gain (.-)%.?$")
   if buff then return buff end
   return nil
 end
 
+local function ParseExtraAttackCount(msg)
+  -- Normalize punctuation and colors
+  msg = StripColors(msg)
+  msg = trim(msg)
+
+  -- Numeric versions:
+  -- You gain 1 extra attack through Timeless Strike.
+  -- You gain 2 extra attacks through Windfury Weapon!
+  local n = string.match(msg, "^You gain (%d+) extra attacks? through .-[%.!%?]?$")
+  if n then return tonumber(n) end
+
+  -- Typo versions ("exta"):
+  n = string.match(msg, "^You gain (%d+) exta attacks? through .-[%.!%?]?$")
+  if n then return tonumber(n) end
+
+  -- Rare wording:
+  -- You gain an extra attack through X.
+  local ok = string.match(msg, "^You gain an extra attack through .-[%.!%?]?$")
+  if ok then return 1 end
+
+  return nil
+end
+
 -- ----------------------------
--- Event driver
+-- Event driver (SELF ONLY, but extra-attack parsing is event-agnostic)
 -- ----------------------------
 local f = CreateFrame("Frame")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
 f:RegisterEvent("LEARNED_SPELL_IN_TAB")
 
--- damage events (include DOT ticks on creatures/players)
+-- damage
 f:RegisterEvent("CHAT_MSG_SPELL_SELF_DAMAGE")
 f:RegisterEvent("CHAT_MSG_COMBAT_SELF_HITS")
 f:RegisterEvent("CHAT_MSG_SPELL_PERIODIC_CREATURE_DAMAGE")
 f:RegisterEvent("CHAT_MSG_SPELL_PERIODIC_HOSTILEPLAYER_DAMAGE")
 f:RegisterEvent("CHAT_MSG_SPELL_PERIODIC_FRIENDLYPLAYER_DAMAGE")
 
--- buff gains (for buff-only procs you whitelist)
+-- potential places extra-attack lines can appear (varies by client/server/chat mods)
+f:RegisterEvent("CHAT_MSG_COMBAT_SELF_MISC_INFO")
+f:RegisterEvent("CHAT_MSG_COMBAT_MISC_INFO")
 f:RegisterEvent("CHAT_MSG_SPELL_SELF_BUFF")
 f:RegisterEvent("CHAT_MSG_SPELL_PERIODIC_SELF_BUFFS")
+f:RegisterEvent("CHAT_MSG_SYSTEM")
 
 f:SetScript("OnEvent", function()
   if event == "PLAYER_ENTERING_WORLD" then
@@ -227,6 +259,15 @@ f:SetScript("OnEvent", function()
   local msg = arg1
   if type(msg) ~= "string" then return end
 
+  -- Extra attacks: count them NO MATTER which event they come in on
+  -- But only if it's your message (starts with "You gain ...").
+  local extraCt = ParseExtraAttackCount(msg)
+  if extraCt and extraCt > 0 and string.match(StripColors(msg), "^You gain") then
+    AddExtraAttacks(extraCt)
+    if A.Refresh then A.Refresh() end
+    return
+  end
+
   -- Damage parsing
   if event == "CHAT_MSG_SPELL_SELF_DAMAGE" then
     local action, amount = ParseSelfSpellDamage(msg)
@@ -240,7 +281,6 @@ f:SetScript("OnEvent", function()
     local action, amount = ParseSelfMeleeDamage(msg)
     if action and amount then
       AddDamage(action, amount)
-      -- melee isn't auto-counted as proc
       if A.Refresh then A.Refresh() end
       return
     end
@@ -256,7 +296,7 @@ f:SetScript("OnEvent", function()
     end
   end
 
-  -- Buff gains (optional proc counting)
+  -- Buff gains
   if event == "CHAT_MSG_SPELL_SELF_BUFF" or event == "CHAT_MSG_SPELL_PERIODIC_SELF_BUFFS" then
     local buff = ParseBuffGain(msg)
     if buff then
@@ -315,14 +355,12 @@ window:SetScript("OnMouseUp", function()
   end
 end)
 
--- apply saved position
 window:SetScript("OnShow", function()
   local p = DB()
   this:ClearAllPoints()
   this:SetPoint(p.pos.point, UIParent, p.pos.rel, p.pos.x, p.pos.y)
 end)
 
--- header
 local title = window:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 title:SetPoint("TOPLEFT", 10, -8)
 title:SetText("TheoSoloDPS")
@@ -330,18 +368,15 @@ title:SetText("TheoSoloDPS")
 local close = CreateFrame("Button", nil, window, "UIPanelCloseButton")
 close:SetPoint("TOPRIGHT", 2, 2)
 
--- tabs
 local tabDPS = MakeButton(window, "DPS", 60, 18)
 tabDPS:SetPoint("TOPLEFT", 8, -28)
 local tabProcs = MakeButton(window, "Procs", 60, 18)
 tabProcs:SetPoint("LEFT", tabDPS, "RIGHT", 6, 0)
 
--- summary line
 local summary = window:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 summary:SetPoint("TOPLEFT", 10, -52)
 summary:SetJustifyH("LEFT")
 
--- content holder
 local content = CreateFrame("Frame", nil, window)
 content:SetPoint("TOPLEFT", 8, -66)
 content:SetPoint("BOTTOMRIGHT", -8, 34)
@@ -370,10 +405,8 @@ local function CreateRow(i)
 
   return r
 end
-
 for i=1,8 do rows[i] = CreateRow(i) end
 
--- footer buttons
 local resetBtn = MakeButton(window, "Reset", 60, 18)
 resetBtn:SetPoint("BOTTOMLEFT", 8, 8)
 resetBtn:SetScript("OnClick", function()
@@ -395,7 +428,6 @@ helpBtn:SetScript("OnClick", function()
   DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99TheoSoloDPS|r: /tdps, /tdps reset, /tdps lock|unlock, /tdps proc add <name>, /tdps proc del <name>, /tdps proc list")
 end)
 
--- tab switching
 local activeTab = "dps"
 local function SetTab(which)
   activeTab = which
@@ -407,11 +439,8 @@ local function SetTab(which)
     tabDPS:Enable()
   end
 end
-
 tabDPS:SetScript("OnClick", function() SetTab("dps"); if A.Refresh then A.Refresh() end end)
 tabProcs:SetScript("OnClick", function() SetTab("procs"); if A.Refresh then A.Refresh() end end)
-
--- default: DPS tab active
 tabDPS:Disable()
 tabProcs:Enable()
 
@@ -419,7 +448,7 @@ A.Refresh = function()
   local entry = (playerName and A.data.damage[1][playerName]) or nil
   local total = (entry and entry._sum) or 0
   local ctime = (entry and entry._ctime) or 1
-  local dps = total / math.max(1, ctime)
+  local dps = (total / math.max(1, ctime))
 
   if activeTab == "dps" then
     summary:SetText(string.format("Total: %s  |  DPS: %.1f  |  Time: %ds", Shorten(total), dps, math.floor(ctime)))
@@ -466,7 +495,7 @@ A.Refresh = function()
       return a.count > b.count
     end)
 
-    summary:SetText(string.format("Proc events: %d  (damage procs auto-detected; buff procs via /tdps proc add)", totalProcs))
+    summary:SetText(string.format("Proc counts: %d  (Extra Attacks = extra swings granted)", totalProcs))
 
     local top = list[1] and list[1].count or 0
     for i=1,8 do
@@ -475,11 +504,15 @@ A.Refresh = function()
       if item and top > 0 then
         r:SetValue(item.count / top)
         r.left:SetText(item.name)
-        if item.dmg and item.dmg > 0 then
+
+        if item.name == "Extra Attacks" then
+          r.right:SetText(string.format("%d attacks", math.floor(item.count)))
+        elseif item.dmg and item.dmg > 0 then
           r.right:SetText(string.format("%dx  |  %s dmg", item.count, Shorten(item.dmg)))
         else
           r.right:SetText(string.format("%dx", item.count))
         end
+
         r:Show()
       else
         r:SetValue(0)
@@ -490,15 +523,11 @@ A.Refresh = function()
     end
   end
 
-  -- keep lock button label in sync
   lockBtn:SetText(DB().lock == 1 and "Unlock" or "Lock")
 end
 
 A.Refresh()
 
--- ----------------------------
--- Slash commands
--- ----------------------------
 SLASH_THEOSOLODPS1 = "/tdps"
 SlashCmdList["THEOSOLODPS"] = function(msg)
   msg = trim(msg or "")
@@ -551,7 +580,6 @@ SlashCmdList["THEOSOLODPS"] = function(msg)
     end
   end
 
-  -- default: toggle
   if window:IsShown() then
     DB().visible = 0
     window:Hide()
