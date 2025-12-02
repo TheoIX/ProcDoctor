@@ -1,0 +1,8 @@
+## Interface: 11200
+## Title: TheoSoloDPS
+## Notes: Simple personal DPS + proc tracker (Turtle/Vanilla 1.12)
+## Author: ChatGPT
+## Version: 0.1
+## SavedVariables: TheoSoloDPSDB
+
+TheoSoloDPS.lua
