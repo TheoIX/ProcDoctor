@@ -1020,7 +1020,3 @@ SlashCmdList["THEOSOLODPS"] = function(msg)
     window:Show()
   end
 end
-
-    window:Show()
-  end
-end
