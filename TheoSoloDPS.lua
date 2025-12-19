@@ -44,7 +44,7 @@ end
 A.data = {
   damage = { [1] = {} }, -- [1][playerName][action]=dmg ; with _sum/_ctime/_tick
   procs  = { [1] = {} }, -- [1][procName]={count=n, dmg=n}
-  stats  = { [1] = { auto={}, abil={} } }, -- hit tables
+  stats  = { [1] = { auto={}, abil={}, autoDmg={}, abilDmg={} } }, -- hit tables (+ damage totals)
 }
 A.internals = { _sum=true, _ctime=true, _tick=true }
 
@@ -193,10 +193,13 @@ end
 -- Hit-table stats aggregation
 -- ----------------------------
 local function EnsureStats()
-  A.data.stats[1] = A.data.stats[1] or { auto={}, abil={} }
-  A.data.stats[1].auto = A.data.stats[1].auto or {}
-  A.data.stats[1].abil = A.data.stats[1].abil or {}
-  return A.data.stats[1].auto, A.data.stats[1].abil
+  A.data.stats[1] = A.data.stats[1] or { auto={}, abil={}, autoDmg={}, abilDmg={} }
+  local s = A.data.stats[1]
+  s.auto = s.auto or {}
+  s.abil = s.abil or {}
+  s.autoDmg = s.autoDmg or {}
+  s.abilDmg = s.abilDmg or {}
+  return s.auto, s.abil, s.autoDmg, s.abilDmg
 end
 
 local function IncStat(which, key, inc)
@@ -207,6 +210,16 @@ local function IncStat(which, key, inc)
   TouchSegment()
   t[key] = (t[key] or 0) + inc
 end
+
+local function IncStatDmg(which, key, amount)
+  local _, _, autoDmg, abilDmg = EnsureStats()
+  local t = (which == "auto") and autoDmg or abilDmg
+  amount = tonumber(amount) or 0
+  if amount <= 0 then return end
+  TouchSegment()
+  t[key] = (t[key] or 0) + amount
+end
+
 
 local function SumStats(t, keys)
   local s = 0
@@ -220,7 +233,7 @@ end
 local function ResetSegment()
   A.data.damage[1] = {}
   A.data.procs[1] = {}
-  A.data.stats[1] = { auto={}, abil={} }
+  A.data.stats[1] = { auto={}, abil={}, autoDmg={}, abilDmg={} }
   A.seg.start = nil
 end
 
@@ -385,6 +398,9 @@ f:SetScript("OnEvent", function()
 
     local action, amount = ParseSelfMeleeDamage(msg)
     if action and amount then
+      if res == "hit" or res == "crit" or res == "glance" then
+        IncStatDmg("auto", res, amount)
+      end
       AddDamage(action, amount)
       if A.Refresh then A.Refresh() end
       return
@@ -404,6 +420,9 @@ f:SetScript("OnEvent", function()
 
     local action, amount = ParseSelfSpellDamage(msg)
     if action and amount then
+      if ares == "hit" or ares == "crit" then
+        IncStatDmg("abil", ares, amount)
+      end
       AddDamage(action, amount)
       AddDamageProc(action, amount)
       if A.Refresh then A.Refresh() end
@@ -826,7 +845,7 @@ local function BuildListForTab()
     end)
 
   else -- stats
-    local auto, abil = EnsureStats()
+    local auto, abil, autoDmg, abilDmg = EnsureStats()
     if statsMode == "auto" then
       local total = SumStats(auto, { "hit","crit","glance","miss","dodge","parry","block" })
       local cats = {
@@ -840,7 +859,7 @@ local function BuildListForTab()
       }
       for _,c in ipairs(cats) do
         local v = auto[c.key] or 0
-        table.insert(items, { name=c.name, val=v, kind="stat", total=total })
+        table.insert(items, { name=c.name, val=v, dmg=(autoDmg and autoDmg[c.key]) or 0, kind="stat", total=total })
         if v > maxVal then maxVal = v end
       end
       table.insert(items, { name="Total Swings", val=total, kind="stat_total" })
@@ -859,7 +878,7 @@ local function BuildListForTab()
       }
       for _,c in ipairs(cats) do
         local v = abil[c.key] or 0
-        table.insert(items, { name=c.name, val=v, kind="stat", total=total })
+        table.insert(items, { name=c.name, val=v, dmg=(abilDmg and abilDmg[c.key]) or 0, kind="stat", total=total })
         if v > maxVal then maxVal = v end
       end
       table.insert(items, { name="Total Abilities", val=total, kind="stat_total" })
@@ -934,7 +953,12 @@ A.Refresh = function()
         end
       elseif it.kind == "stat" then
         local pct = (it.total and it.total > 0) and ((v / it.total) * 100) or 0
-        r.right:SetText(string.format("%d (%.1f%%)", v, pct))
+        local dmg = tonumber(it.dmg) or 0
+        if dmg > 0 and v > 0 then
+          r.right:SetText(string.format("%d (%.1f%%) | %s", v, pct, Shorten(dmg)))
+        else
+          r.right:SetText(string.format("%d (%.1f%%)", v, pct))
+        end
       elseif it.kind == "stat_total" then
         r.right:SetText(tostring(v))
       else
