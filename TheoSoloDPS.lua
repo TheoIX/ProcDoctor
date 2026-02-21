@@ -62,6 +62,7 @@ end
 
 local playerName = nil
 local knownSpells = {}
+local procCountFromBuffSeen = {}
 
 local function trim(s) return string.gsub(s or "", "^%s*(.-)%s*$", "%1") end
 
@@ -137,8 +138,9 @@ local function IncProc(name, dmg, inc)
   local seg = A.data.procs[1]
   seg[name] = seg[name] or { count = 0, dmg = 0 }
 
-  inc = tonumber(inc) or 1
-  if inc < 1 then inc = 1 end
+  inc = tonumber(inc)
+  if inc == nil then inc = 1 end
+  if inc < 0 then inc = 0 end
 
   seg[name].count = (seg[name].count or 0) + inc
   if dmg and tonumber(dmg) and tonumber(dmg) > 0 then
@@ -171,6 +173,9 @@ end
 
 local function AddBuffProc(buffName)
   if not buffName then return end
+  buffName = trim(buffName)
+  procCountFromBuffSeen[buffName] = true
+
   if IsProcAction(buffName, false) then
     IncProc(buffName, 0, 1)
   end
@@ -178,7 +183,21 @@ end
 
 local function AddDamageProc(action, amount)
   if not action then return end
-  if IsProcAction(action, true) then
+  action = trim(action)
+
+  -- Safety: incoming enemy spell names often look like "Mob's Spell"
+  -- Do not auto-count those as your procs unless explicitly whitelisted.
+  if string.find(action, "'s ") and not DB().procWhitelist[action] then
+    return
+  end
+
+  if not IsProcAction(action, true) then return end
+
+  -- If this proc also reports a buff gain, count activations from the buff line only.
+  -- Still accumulate proc damage from damage events.
+  if procCountFromBuffSeen[action] then
+    IncProc(action, amount, 0)
+  else
     IncProc(action, amount, 1)
   end
 end
@@ -235,35 +254,36 @@ local function ResetSegment()
   A.data.procs[1] = {}
   A.data.stats[1] = { auto={}, abil={}, autoDmg={}, abilDmg={} }
   A.seg.start = nil
+  procCountFromBuffSeen = {}
 end
 
 -- ----------------------------
 -- Combat log parsing (EN patterns; extend as needed)
 -- ----------------------------
 local function ParseSelfSpellDamage(msg)
-  local action, amount = string.match(msg, "^Your (.-) hits .- for (%d+)")
+  local _, _, action, amount = string.find(msg, "^Your (.-) hits .- for (%d+)")
   if action and amount then return action, tonumber(amount) end
-  action, amount = string.match(msg, "^Your (.-) crits .- for (%d+)")
+  _, _, action, amount = string.find(msg, "^Your (.-) crits .- for (%d+)")
   if action and amount then return action, tonumber(amount) end
   return nil
 end
 
 local function ParseSelfMeleeDamage(msg)
-  local amount = string.match(msg, "^You hit .- for (%d+)")
+  local _, _, amount = string.find(msg, "^You hit .- for (%d+)")
   if amount then return "Melee", tonumber(amount) end
-  amount = string.match(msg, "^You crit .- for (%d+)")
+  _, _, amount = string.find(msg, "^You crit .- for (%d+)")
   if amount then return "Melee", tonumber(amount) end
   return nil
 end
 
 local function ParsePeriodicYourDamage(msg)
-  local _, amount, action = string.match(msg, "^(.-) suffers (%d+) .- from your (.-)%.?$")
+  local _, _, _, amount, action = string.find(msg, "^(.-) suffers (%d+) .- from your (.-)%.?$")
   if action and amount then return action, tonumber(amount) end
   return nil
 end
 
 local function ParseBuffGain(msg)
-  local buff = string.match(msg, "^You gain (.-)%.?$")
+  local _, _, buff = string.find(msg, "^You gain (.-)%.?$")
   if buff then return buff end
   return nil
 end
@@ -273,13 +293,13 @@ local function ParseExtraAttackProc(msg)
   msg = StripColors(msg)
   msg = trim(msg)
 
-  local n, via = string.match(msg, "^You gain (%d+) extra attacks? through (.-)[%.!%?]?$")
+  local _, _, n, via = string.find(msg, "^You gain (%d+) extra attacks? through (.-)[%.!%?]?$")
   if via and n then return trim(via), tonumber(n) end
 
-  n, via = string.match(msg, "^You gain (%d+) exta attacks? through (.-)[%.!%?]?$")
+  _, _, n, via = string.find(msg, "^You gain (%d+) exta attacks? through (.-)[%.!%?]?$")
   if via and n then return trim(via), tonumber(n) end
 
-  via = string.match(msg, "^You gain an extra attack through (.-)[%.!%?]?$")
+  _, _, via = string.find(msg, "^You gain an extra attack through (.-)[%.!%?]?$")
   if via then return trim(via), 1 end
 
   return nil
@@ -290,8 +310,8 @@ local function ParseAutoHitResult(msg)
   msg = StripColors(msg)
   msg = trim(msg)
 
-  if string.match(msg, "^You crit ") then return "crit" end
-  if string.match(msg, "^You hit ") then
+  if string.find(msg, "^You crit ") then return "crit" end
+  if string.find(msg, "^You hit ") then
     if string.find(string.lower(msg), "glancing") then return "glance" end
     return "hit"
   end
@@ -316,15 +336,15 @@ local function ParseAbilityResult(msg)
   msg = trim(msg)
   local low = string.lower(msg)
 
-  if string.match(msg, "^Your .- hits ") then return "hit" end
-  if string.match(msg, "^Your .- crits ") then return "crit" end
+  if string.find(msg, "^Your .- hits ") then return "hit" end
+  if string.find(msg, "^Your .- crits ") then return "crit" end
 
-  if string.find(low, "miss") and string.match(msg, "^Your ") then return "miss" end
-  if string.find(low, "dodge") and string.match(msg, "^Your ") then return "dodge" end
-  if string.find(low, "parry") and string.match(msg, "^Your ") then return "parry" end
-  if string.find(low, "block") and string.match(msg, "^Your ") then return "block" end
-  if string.find(low, "resist") and string.match(msg, "^Your ") then return "resist" end
-  if string.find(low, "immune") and string.match(msg, "^Your ") then return "immune" end
+  if string.find(low, "miss") and string.find(msg, "^Your ") then return "miss" end
+  if string.find(low, "dodge") and string.find(msg, "^Your ") then return "dodge" end
+  if string.find(low, "parry") and string.find(msg, "^Your ") then return "parry" end
+  if string.find(low, "block") and string.find(msg, "^Your ") then return "block" end
+  if string.find(low, "resist") and string.find(msg, "^Your ") then return "resist" end
+  if string.find(low, "immune") and string.find(msg, "^Your ") then return "immune" end
 
   return nil
 end
@@ -378,7 +398,7 @@ f:SetScript("OnEvent", function()
 
   -- Extra attacks: always count total, optionally per-source if whitelisted
   local procName, extraCt = ParseExtraAttackProc(msg)
-  if extraCt and extraCt > 0 and string.match(StripColors(msg), "^You gain") then
+  if extraCt and extraCt > 0 and string.find(StripColors(msg), "^You gain") then
     AddExtraAttacks(extraCt)
     if procName and DB().procWhitelist[procName] then
       -- counts = extra swings granted by that proc
@@ -432,13 +452,19 @@ f:SetScript("OnEvent", function()
   elseif event == "CHAT_MSG_SPELL_PERIODIC_CREATURE_DAMAGE"
       or event == "CHAT_MSG_SPELL_PERIODIC_HOSTILEPLAYER_DAMAGE"
       or event == "CHAT_MSG_SPELL_PERIODIC_FRIENDLYPLAYER_DAMAGE" then
-    local action, amount = ParsePeriodicYourDamage(msg)
-    if action and amount then
-      AddDamage(action, amount)
-      AddDamageProc(action, amount)
-      if A.Refresh then A.Refresh() end
-      return
+    -- Extra safety: only parse outgoing periodic lines that explicitly say "from your ..."
+    if not string.find(string.lower(msg), " from your ") then
+      -- skip incoming/other-party periodic damage
+    else
+      local action, amount = ParsePeriodicYourDamage(msg)
+      if action and amount then
+        AddDamage(action, amount)
+        AddDamageProc(action, amount)
+        if A.Refresh then A.Refresh() end
+        return
+      end
     end
+
   end
 
   -- Buff gains: whitelist-style procs
@@ -983,7 +1009,7 @@ A.Refresh()
 SLASH_THEOSOLODPS1 = "/tdps"
 SlashCmdList["THEOSOLODPS"] = function(msg)
   msg = trim(msg or "")
-  local cmd, rest = string.match(msg, "^(%S+)%s*(.-)$")
+  local _, _, cmd, rest = string.find(msg, "^(%S+)%s*(.-)$")
   cmd = cmd and string.lower(cmd)
 
   if cmd == "show" then
@@ -1009,7 +1035,7 @@ SlashCmdList["THEOSOLODPS"] = function(msg)
     A.Refresh()
     return
   elseif cmd == "proc" then
-    local sub, name = string.match(rest or "", "^(%S+)%s*(.-)$")
+    local _, _, sub, name = string.find(rest or "", "^(%S+)%s*(.-)$")
     sub = sub and string.lower(sub) or ""
     name = trim(name)
 
